@@ -95,11 +95,13 @@ if __name__ == '__main__':
     user_his = torch.LongTensor(np.array(list(user_his.values()), dtype = 'int32'))
     print ('num_user: ', len(user_his))
     
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
     model = Multi_Rep_Predictor(num_head, hid_dim, word_dim, word_matrix, entity_dim, entity_matrix, num_prototype, dropout_rate, multi_rep_mode, infonce_mode, contrastive_mode, gnn_mode, agg_mode)
     if torch.cuda.is_available():
-        model = nn.DataParallel(model).cuda()
-    else:
         model = nn.DataParallel(model)
+    model = model.to(device)
  
     #user_adj = []
     #f = open('small_user_nei_sort.txt', 'r', encoding='utf-8')
@@ -144,21 +146,22 @@ if __name__ == '__main__':
             for step, (train_candidate, train_user, train_label,
                         train_pop, train_unpop, train_diff) in enumerate(train_loader):
                 t1 = time.time()
-                candidate_title, his_title, train_label = news_title[train_candidate], news_title[user_his[train_user]], train_label
-                candidate_title, his_title, train_label = Variable(candidate_title),Variable(his_title), Variable(train_label)
-                candidate_abstract, his_abstract  = news_abstract[train_candidate], news_abstract[user_his[train_user]]
-                candidate_abstract, his_abstract  = Variable(candidate_abstract),Variable(his_abstract)
+                candidate_title, his_title = news_title[train_candidate].to(device), news_title[user_his[train_user]].to(device)
+                train_label = train_label.to(device)
+                candidate_title, his_title, train_label = Variable(candidate_title), Variable(his_title), Variable(train_label)
+                candidate_abstract, his_abstract  = news_abstract[train_candidate].to(device), news_abstract[user_his[train_user]].to(device)
+                candidate_abstract, his_abstract  = Variable(candidate_abstract), Variable(his_abstract)
                 print (candidate_title.size(), candidate_abstract.size())
 
                 # --- Popularity Debiased Augmentation: look up titles/abstracts for triplet ---
                 # Each of train_pop/unpop/diff is [batch] of news int_ids.
                 # news_title shape: [num_news, 20]. Lookup gives [batch, 20]; unsqueeze to [batch, 1, 20].
-                pop_title    = Variable(news_title[train_pop].unsqueeze(1))
-                pop_abstract = Variable(news_abstract[train_pop].unsqueeze(1))
-                unpop_title    = Variable(news_title[train_unpop].unsqueeze(1))
-                unpop_abstract = Variable(news_abstract[train_unpop].unsqueeze(1))
-                diff_title    = Variable(news_title[train_diff].unsqueeze(1))
-                diff_abstract = Variable(news_abstract[train_diff].unsqueeze(1))
+                pop_title    = Variable(news_title[train_pop].unsqueeze(1).to(device))
+                pop_abstract = Variable(news_abstract[train_pop].unsqueeze(1).to(device))
+                unpop_title    = Variable(news_title[train_unpop].unsqueeze(1).to(device))
+                unpop_abstract = Variable(news_abstract[train_unpop].unsqueeze(1).to(device))
+                diff_title    = Variable(news_title[train_diff].unsqueeze(1).to(device))
+                diff_abstract = Variable(news_abstract[train_diff].unsqueeze(1).to(device))
 
                 model.train()
                 optimizer.zero_grad()
@@ -169,7 +172,7 @@ if __name__ == '__main__':
                 predictor_loss = criterion(predictor_logits, train_label)
                 
                 if contrastive_mode == 'USER':
-                    user_infoNCE_labels = torch.zeros(len(user_infoNCE_logits), dtype=torch.long)
+                    user_infoNCE_labels = torch.zeros(len(user_infoNCE_logits), dtype=torch.long).to(device)
                     user_infoNCE_loss = F.cross_entropy(user_infoNCE_logits, user_infoNCE_labels)
 
                     # --- Popularity Debiased CL loss (beta = 0.5) ---
@@ -179,13 +182,13 @@ if __name__ == '__main__':
                     if news_debiased_logits is not None:
                         valid_rows = (news_debiased_logits.abs().sum(dim=-1) > 0)  # [batch] bool
                         if valid_rows.any():
-                            debiased_labels = torch.zeros(valid_rows.sum(), dtype=torch.long)
+                            debiased_labels = torch.zeros(valid_rows.sum(), dtype=torch.long).to(device)
                             news_debiased_loss = F.cross_entropy(
                                 news_debiased_logits[valid_rows], debiased_labels)
                         else:
-                            news_debiased_loss = torch.tensor(0.0)
+                            news_debiased_loss = torch.tensor(0.0).to(device)
                     else:
-                        news_debiased_loss = torch.tensor(0.0)
+                        news_debiased_loss = torch.tensor(0.0).to(device)
 
                     print ('predictor_loss: ', predictor_loss.data.item(),
                            'user_infoNCE_loss: ', user_infoNCE_loss.data.item(),
@@ -277,10 +280,10 @@ if __name__ == '__main__':
                 #print ('index_of_batch_valdataset: ', i)
 
                 #temp_candidate_title, temp_his_title = news_title[torch.LongTensor(val_candidate[i])].unsqueeze(dim = 1).cuda(), news_title[user_his[torch.LongTensor(val_user[i])]].cuda()
-                candidate_title, his_title = news_title[val_candidate].unsqueeze(dim = 1), news_title[user_his[val_user]]
+                candidate_title, his_title = news_title[val_candidate].unsqueeze(dim = 1).to(device), news_title[user_his[val_user]].to(device)
                 candidate_title, his_title = Variable(candidate_title), Variable(his_title)
                 #temp_candidate_abstract, temp_his_abstract = news_abstract[torch.LongTensor(val_candidate[i])].unsqueeze(dim = 1).cuda(), news_abstract[user_his[torch.LongTensor(val_user[i])]].cuda()
-                candidate_abstract, his_abstract = news_abstract[val_candidate].unsqueeze(dim = 1), news_abstract[user_his[val_user]]
+                candidate_abstract, his_abstract = news_abstract[val_candidate].unsqueeze(dim = 1).to(device), news_abstract[user_his[val_user]].to(device)
                 candidate_abstract, his_abstract = Variable(candidate_abstract), Variable(his_abstract)
                 print (candidate_title.size(), his_title.size(), candidate_abstract.size(), his_abstract.size())
 
