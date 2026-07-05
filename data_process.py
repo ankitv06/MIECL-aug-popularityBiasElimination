@@ -190,10 +190,16 @@ class DataProcess():
 
         # --- Step 2: Determine popularity thresholds ---
         counts = list(self.news_click_count.values())
-        pop_threshold   = float(np.percentile(counts, POPULAR_PCTILE))   # >= this -> popular
-        unpop_threshold = float(np.percentile(counts, UNPOPULAR_PCTILE)) # <= this -> non-popular
-        print(f'  popular threshold (>= {POPULAR_PCTILE}th pctile): {pop_threshold} clicks')
-        print(f'  non-popular threshold (<= {UNPOPULAR_PCTILE}th pctile): {unpop_threshold} clicks')
+        nonzero_counts = [cnt for cnt in counts if cnt > 0]
+        
+        if nonzero_counts:
+            pop_threshold   = float(np.percentile(nonzero_counts, POPULAR_PCTILE))   # >= this -> popular
+            unpop_threshold = float(np.percentile(nonzero_counts, UNPOPULAR_PCTILE)) # <= this -> non-popular
+        else:
+            pop_threshold, unpop_threshold = 1.0, 0.0
+            
+        print(f'  popular threshold (>= {POPULAR_PCTILE}th pctile of non-zero): {pop_threshold} clicks')
+        print(f'  non-popular threshold (<= {UNPOPULAR_PCTILE}th pctile of non-zero): {unpop_threshold} clicks')
 
         for nid, cnt in self.news_click_count.items():
             if cnt >= pop_threshold:
