@@ -131,7 +131,6 @@ if __name__ == '__main__':
         train_dataset = Data.TensorDataset(train_candidate, train_user, train_label,
                                            train_pop, train_unpop, train_diff)
         train_loader = Data.DataLoader(dataset=train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
-        '''
         for n_ep in range(num_epoch):
             acc, all = 0, 0
             t0 = time.time()
@@ -205,7 +204,6 @@ if __name__ == '__main__':
             torch.save(model.state_dict(), preserve_dir + '/model_{}.pkl'.format(n_d * num_epoch + n_ep + 1))
             print('epoch: {:04d}'.format(n_d * num_epoch + n_ep + 1), 'time: {:.4f}'.format(time.time() - t0))
         del train_candidate, train_user, train_label
-    '''
     print("TRAINING DONE-------------------------------------------------------------------------------------------------------------------------------------------------")
     # validation and evaluation
     
