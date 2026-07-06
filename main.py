@@ -78,6 +78,11 @@ if __name__ == '__main__':
     data_module = DataProcess(file1, file2, file3, file4, file5, file6)
     news_title, news_abstract = data_module.process_train_val_news()
     news_title, news_abstract = torch.LongTensor(news_title), torch.LongTensor(news_abstract)
+
+    # Compute article popularity and build per-topic pools for augmentation
+    # Must be called after process_train_val_news() (needs news_id and category maps)
+    # and before pre_train_behaviors() (which uses the pools)
+    data_module.compute_popularity()
     
     entity_matrix = data_module.generate_entity_matrix()
     entity_dim = entity_matrix.size(1)
@@ -121,9 +126,11 @@ if __name__ == '__main__':
     min_loss = float('inf')
 
     for n_d in range(num_dataset):
-        # training loop
-        [train_candidate, train_user, train_label] = data_module.pre_train_behaviors()
-        train_dataset = Data.TensorDataset(train_candidate, train_user, train_label)
+        # training loop — pre_train_behaviors now returns 6 tensors
+        [train_candidate, train_user, train_label,
+         train_pop, train_unpop, train_diff] = data_module.pre_train_behaviors()
+        train_dataset = Data.TensorDataset(train_candidate, train_user, train_label,
+                                           train_pop, train_unpop, train_diff)
         train_loader = Data.DataLoader(dataset=train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
         '''
         for n_ep in range(num_epoch):
@@ -136,7 +143,8 @@ if __name__ == '__main__':
             # neighboring users and corresponding news titles and abstracts are obtained
             # model set to training mode + gradients set to 0
             # model saved after every epoch
-            for step, (train_candidate, train_user, train_label) in enumerate(train_loader):
+            for step, (train_candidate, train_user, train_label,
+                        train_pop, train_unpop, train_diff) in enumerate(train_loader):
                 t1 = time.time()
                 candidate_title, his_title, train_label = news_title[train_candidate], news_title[user_his[train_user]], train_label
                 candidate_title, his_title, train_label = Variable(candidate_title),Variable(his_title), Variable(train_label)
@@ -144,27 +152,47 @@ if __name__ == '__main__':
                 candidate_abstract, his_abstract  = Variable(candidate_abstract),Variable(his_abstract)
                 print (candidate_title.size(), candidate_abstract.size())
 
-                #neighbor_user = user_adj[train_user]
-                #(neighbor_1, neighbor_2) = torch.split(neighbor_user, 1, dim = 1)
-                #neighbor_1, neighbor_2 = neighbor_1.squeeze(dim = 1), neighbor_2.squeeze(dim = 1)
-                
-                #nei1_title, nei1_abstract  = news_title[user_his[neighbor_1]].cuda(), news_abstract[user_his[neighbor_1]].cuda()
-                #nei1_title, nei1_abstract = Variable(nei1_title), Variable(nei1_abstract)
-                #nei2_title, nei2_abstract  = news_title[user_his[neighbor_2]].cuda(), news_abstract[user_his[neighbor_2]].cuda()
-                #nei2_title, nei2_abstract = Variable(nei2_title), Variable(nei2_abstract)
+                # --- Popularity Debiased Augmentation: look up titles/abstracts for triplet ---
+                # Each of train_pop/unpop/diff is [batch] of news int_ids.
+                # news_title shape: [num_news, 20]. Lookup gives [batch, 20]; unsqueeze to [batch, 1, 20].
+                pop_title    = Variable(news_title[train_pop].unsqueeze(1))
+                pop_abstract = Variable(news_abstract[train_pop].unsqueeze(1))
+                unpop_title    = Variable(news_title[train_unpop].unsqueeze(1))
+                unpop_abstract = Variable(news_abstract[train_unpop].unsqueeze(1))
+                diff_title    = Variable(news_title[train_diff].unsqueeze(1))
+                diff_abstract = Variable(news_abstract[train_diff].unsqueeze(1))
 
                 model.train()
                 optimizer.zero_grad()
 
-                #predictor_logits, user_infoNCE_logits = model(candidate_title, candidate_abstract, his_title, his_abstract, neighbor_title, neighbor_abstract)
-                predictor_logits, user_infoNCE_logits = model(candidate_title, candidate_abstract, his_title, his_abstract)
+                predictor_logits, user_infoNCE_logits, news_debiased_logits = model(
+                    candidate_title, candidate_abstract, his_title, his_abstract,
+                    pop_title, pop_abstract, unpop_title, unpop_abstract, diff_title, diff_abstract)
                 predictor_loss = criterion(predictor_logits, train_label)
                 
                 if contrastive_mode == 'USER':
                     user_infoNCE_labels = torch.zeros(len(user_infoNCE_logits), dtype=torch.long)
                     user_infoNCE_loss = F.cross_entropy(user_infoNCE_logits, user_infoNCE_labels)
-                    print ('predictor_loss: ', predictor_loss.data.item(), 'user_infoNCE_loss: ', user_infoNCE_loss.data.item())
-                    loss = predictor_loss + alpha * user_infoNCE_loss
+
+                    # --- Popularity Debiased CL loss (beta = 0.5) ---
+                    # Only include non-sentinel rows (those not zeroed by the mask in model.py).
+                    # A zeroed row has both logits == 0; we exclude it to avoid pulling the loss
+                    # toward a trivially-satisfied example.
+                    if news_debiased_logits is not None:
+                        valid_rows = (news_debiased_logits.abs().sum(dim=-1) > 0)  # [batch] bool
+                        if valid_rows.any():
+                            debiased_labels = torch.zeros(valid_rows.sum(), dtype=torch.long)
+                            news_debiased_loss = F.cross_entropy(
+                                news_debiased_logits[valid_rows], debiased_labels)
+                        else:
+                            news_debiased_loss = torch.tensor(0.0)
+                    else:
+                        news_debiased_loss = torch.tensor(0.0)
+
+                    print ('predictor_loss: ', predictor_loss.data.item(),
+                           'user_infoNCE_loss: ', user_infoNCE_loss.data.item(),
+                           'news_debiased_loss: ', news_debiased_loss.data.item())
+                    loss = predictor_loss + alpha * user_infoNCE_loss + 0.5 * news_debiased_loss
                 else:
                     print ('predictor_loss: ', predictor_loss.data.item())
                     loss = predictor_loss
@@ -275,7 +303,7 @@ if __name__ == '__main__':
                 #neighbor_title, neighbor_abstract = Variable(neighbor_title), Variable(neighbor_abstract)
                 #print (neighbor_title.size(), neighbor_abstract.size())
 
-                predictor_logits, _ = model(candidate_title, candidate_abstract, his_title, his_abstract)
+                predictor_logits, _, _ = model(candidate_title, candidate_abstract, his_title, his_abstract)
                 # prob of clicking on that article
                 score = torch.sigmoid(predictor_logits).cpu().data.numpy()
                 val_score = val_score + score.tolist()
