@@ -119,10 +119,21 @@ if __name__ == '__main__':
     model = model
     
     criterion = nn.BCEWithLogitsLoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    # Use lr and weight_decay from argparse (defaults: lr=0.001, weight_decay=1e-4).
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     #optimizer = optim.SGD(model.parameters(), lr=0.01,momentum=0.1)
     #optimizer = optim.Adamax(model.parameters(), lr=0.002)
-    
+
+    # FIX 5: CosineAnnealingLR scheduler.
+    # Smoothly decays lr from `lr` (e.g. 0.001) down toward eta_min=1e-5 over
+    # T_max=num_epoch steps. This means:
+    #   - Early epochs: lr is high -> fast convergence
+    #   - Late epochs:  lr is low  -> fine-tuned updates, harder to diverge
+    #   - If a loss spike happens late in training, the smaller lr limits recovery
+    #     overshoot. Without a scheduler, lr=0.001 stays constant for 200 epochs.
+    T_max = max(num_epoch * num_dataset, 1)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=T_max, eta_min=1e-5)
+
     best_epoch = 0
     min_loss = float('inf')
 
@@ -193,19 +204,52 @@ if __name__ == '__main__':
                     print ('predictor_loss: ', predictor_loss.data.item(),
                            'user_infoNCE_loss: ', user_infoNCE_loss.data.item(),
                            'news_debiased_loss: ', news_debiased_loss.data.item())
-                    loss = predictor_loss + alpha * user_infoNCE_loss + 0.5 * news_debiased_loss
+
+                    # FIX 6: Reduce auxiliary loss weights so predictor_loss dominates.
+                    #
+                    # Before: loss = predictor_loss + 1.0*user_infoNCE + 0.5*news_debiased
+                    #   -> aux losses had equal or greater weight than the main task.
+                    #   -> When aux losses exploded (e.g. user_infoNCE=4.7e11), the
+                    #      gradient from the main task was completely drowned out.
+                    #
+                    # After:  loss = predictor_loss + 0.1*user_infoNCE + 0.1*news_debiased
+                    #   -> Both aux losses are light regularizers (10% weight each).
+                    #   -> predictor_loss always drives training; aux losses shape
+                    #      the embedding space without hijacking the optimizer.
+                    #   -> To measure debiasing contribution: run ablation with
+                    #      news_debiased_weight=0.0 and compare AUC/nDCG@10.
+                    loss = predictor_loss + 0.1 * user_infoNCE_loss + 0.1 * news_debiased_loss
                 else:
                     print ('predictor_loss: ', predictor_loss.data.item())
                     loss = predictor_loss
                     
                 loss.backward()
+
+                # FIX 4: Gradient clipping — hard ceiling on the gradient norm.
+                # After loss.backward(), PyTorch has computed all parameter gradients.
+                # clip_grad_norm_ rescales the gradient vector so its L2 norm never
+                # exceeds max_norm=1.0 before the optimizer takes its step.
+                #
+                # Why max_norm=1.0 (not 2.0):
+                #   - 2.0 still allows the gradient to move parameters 2x further than
+                #     a typical safe step, which is too lenient given the instability seen.
+                #   - 1.0 provides a tighter bound while still allowing meaningful updates.
+                #   - If clipping fires frequently (logged below), it's a sign that the
+                #     normalized logits are still too large -> reduce temperature further.
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
                 optimizer.step()
 
                 loss_per_epoch.append(loss.data.item())
-                print('epoch: {:04d}'.format(n_d * num_epoch + n_ep + 1), 'step: {:04d}'.format(step + 1), 'loss: {:.4f}'.format(np.mean(loss_per_epoch)), 'time: {:.4f}'.format(time.time() - t1))
+                print('epoch: {:04d}'.format(n_d * num_epoch + n_ep + 1), 'step: {:04d}'.format(step + 1), 'loss: {:.4f}'.format(np.mean(loss_per_epoch)), 'grad_norm: {:.4f}'.format(grad_norm.item()), 'time: {:.4f}'.format(time.time() - t1))
 
+            # FIX 5 (continued): Step the scheduler once per epoch (not per batch).
+            # After each full epoch, the scheduler lowers lr slightly along the cosine curve.
+            scheduler.step()
+            current_lr = scheduler.get_last_lr()[0]
+            print('epoch: {:04d}'.format(n_d * num_epoch + n_ep + 1), 'time: {:.4f}'.format(time.time() - t0), 'lr: {:.6f}'.format(current_lr))
             torch.save(model.state_dict(), preserve_dir + '/model_{}.pkl'.format(n_d * num_epoch + n_ep + 1))
-            print('epoch: {:04d}'.format(n_d * num_epoch + n_ep + 1), 'time: {:.4f}'.format(time.time() - t0))
+
         del train_candidate, train_user, train_label
     print("TRAINING DONE-------------------------------------------------------------------------------------------------------------------------------------------------")
     # validation and evaluation

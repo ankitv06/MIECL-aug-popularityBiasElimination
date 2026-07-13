@@ -292,17 +292,27 @@ class InfoNCE(nn.Module):
 				negative_index = torch.randint(low = 0, high = multi_rep.size(1), size = (1,)).to(multi_rep.device)
 
 			# multi rep - target user rep 
-			anchor = torch.index_select(multi_rep, dim = 1, index = positive_index)    # [30, 1, 400]
+			anchor = torch.index_select(multi_rep, dim = 1, index = positive_index)    # [batch, 1, 400]
 			# uk, Ik -> positive pair
 			positive = torch.index_select(self.prototype, dim = 0, index = positive_index)	  # [1, 400]
 			# uk uj -> negative pair
-			negative = torch.index_select(multi_rep, dim = 1, index = negative_index)	# [30, 1, 400]
+			negative = torch.index_select(multi_rep, dim = 1, index = negative_index)	# [batch, 1, 400]
 
-			# y = uT.nc - user rep (anchor) x canddiate rep (+)
-			positive_logit = torch.matmul(anchor.squeeze(dim = 1), positive.transpose(-1, -2))	   # [30, 1]
-			# y = uT.nc - user rep (anchor) x canddiate rep (+)
-			negative_logit = torch.matmul(anchor, negative.transpose(-1, -2)).squeeze(dim = 2)	   # [30, 1]
-			logits = torch.cat([positive_logit, negative_logit], dim = -1)
+			# FIX 1: L2-normalize all three vectors so dot-products = cosine similarity,
+			# bounded strictly to [-1, +1] regardless of embedding magnitude.
+			# Without this, raw dot products of 400-dim trained embeddings can reach
+			# tens of thousands, causing cross_entropy gradients to explode.
+			anchor   = F.normalize(anchor,   p=2, dim=-1)  # [batch, 1, 400] -> unit norm
+			positive = F.normalize(positive, p=2, dim=-1)  # [1,     400]    -> unit norm
+			negative = F.normalize(negative, p=2, dim=-1)  # [batch, 1, 400] -> unit norm
+
+			# FIX 2: Temperature τ=0.1 sharpens the distribution (standard in SimCLR/MoCo).
+			# Dividing by τ scales bounded logits from [-1,1] to [-10,+10] — sharp enough
+			# to learn a meaningful contrastive signal, but still safely bounded.
+			TAU = 0.1
+			positive_logit = torch.matmul(anchor.squeeze(dim = 1), positive.transpose(-1, -2)) / TAU	   # [batch, 1]
+			negative_logit = torch.matmul(anchor, negative.transpose(-1, -2)).squeeze(dim = 2) / TAU	   # [batch, 1]
+			logits = torch.cat([positive_logit, negative_logit], dim = -1)  # [batch, 2]
 
 		# --- Popularity Debiased Augmentation: news-level contrastive learning ---
 		# Anchor:   popular article rep          (news_pair[0])  [batch, 400]
@@ -317,14 +327,21 @@ class InfoNCE(nn.Module):
 			assert news_pair is not None, "popularity_debiased mode requires news_pair=(popular_rep, unpopular_rep, diff_rep)"
 			popular_rep, unpopular_rep, diff_rep = news_pair  # each [batch, 400]
 
-			anchor   = popular_rep    # [batch, 400]
-			positive = unpopular_rep  # [batch, 400]  — same topic, less popular
-			negative = diff_rep       # [batch, 400]  — different topic
+			# FIX 3: L2-normalize news embeddings here too.
+			# News encoder outputs also grow in magnitude during long training runs,
+			# which would make raw dot-products explode identically to Fix 1 above.
+			# After normalization, cosine similarity is in [-1, +1] and we apply
+			# temperature τ=0.2 (slightly softer than user-level, because topic-level
+			# distinctions are inherently less sharp than prototype alignment).
+			TAU = 0.2
+			anchor   = F.normalize(popular_rep,   p=2, dim=-1)  # [batch, 400] -> unit norm
+			positive = F.normalize(unpopular_rep, p=2, dim=-1)  # [batch, 400] -> unit norm
+			negative = F.normalize(diff_rep,      p=2, dim=-1)  # [batch, 400] -> unit norm
 
-			# Element-wise dot product: each sample's anchor dotted with its own positive/negative
-			pos_logit = (anchor * positive).sum(dim=-1, keepdim=True)  # [batch, 1]
-			neg_logit = (anchor * negative).sum(dim=-1, keepdim=True)  # [batch, 1]
-			logits = torch.cat([pos_logit, neg_logit], dim=-1)         # [batch, 2]
+			# Cosine-similarity-based logits scaled by temperature
+			pos_logit = (anchor * positive).sum(dim=-1, keepdim=True) / TAU  # [batch, 1]
+			neg_logit = (anchor * negative).sum(dim=-1, keepdim=True) / TAU  # [batch, 1]
+			logits = torch.cat([pos_logit, neg_logit], dim=-1)               # [batch, 2]
 
 		return logits
 	
