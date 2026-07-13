@@ -18,6 +18,7 @@ import pickle
 import argparse
 import os
 import glob
+import csv
 
 
 if __name__ == '__main__':
@@ -33,7 +34,7 @@ if __name__ == '__main__':
     parser.add_argument('--alpha', type=float, default=1.0)
     parser.add_argument('--num_negative_sample', type=int, default=3)
     parser.add_argument('--word_dim', type=int, default=300)
-    parser.add_argument('--preserve_dir', type=str, default='C:/Users/anany/Desktop/Ananya/2023/Estonia Projects/News Recc/MIECL-master')
+    parser.add_argument('--preserve_dir', type=str, default='dataset/outputs-after-200-epochs')
     parser.add_argument('--pretrain_method', type=str, default='glove')
     parser.add_argument('--dropout_rate', type=float, default=0.1)
     parser.add_argument('--multi_rep_mode', type=str, default='concat')
@@ -149,6 +150,30 @@ if __name__ == '__main__':
             t0 = time.time()
             loss_per_epoch = []
 
+            # Open a fresh CSV log file for this epoch.
+            # Each epoch gets its own file: epoch_0001_loss_log.csv, epoch_0002_loss_log.csv, …
+            # Columns logged every step:
+            #   epoch          – global epoch number (n_d * num_epoch + n_ep + 1)
+            #   step           – batch index within the epoch (1-indexed)
+            #   predictor_loss – BCE between predicted scores and click labels (main task)
+            #   user_infoNCE   – contrastive loss aligning user rep with interest prototype
+            #   news_debiased  – contrastive loss pushing same-topic reps together (our addition)
+            #   total_loss     – weighted sum: pred + 0.1*NCE + 0.1*debiased
+            #   mean_loss      – running mean of total_loss over steps seen so far this epoch
+            #   grad_norm      – L2 norm of gradients BEFORE clipping (>1.0 means clip fired)
+            #   lr             – current learning rate from the scheduler
+            #   step_time_s    – wall-clock seconds for this single step
+            global_epoch = n_d * num_epoch + n_ep + 1
+            log_path = os.path.join(preserve_dir, 'epoch_{:04d}_loss_log.csv'.format(global_epoch))
+            log_file = open(log_path, 'w', newline='', encoding='utf-8')
+            log_writer = csv.writer(log_file)
+            log_writer.writerow([
+                'epoch', 'step',
+                'predictor_loss', 'user_infoNCE_loss', 'news_debiased_loss',
+                'total_loss', 'mean_loss',
+                'grad_norm', 'lr', 'step_time_s'
+            ])
+
             # batches from the training loader
             # news titles and abstracts are obtained based on user behavior
             # neighboring users and corresponding news titles and abstracts are obtained
@@ -241,7 +266,35 @@ if __name__ == '__main__':
                 optimizer.step()
 
                 loss_per_epoch.append(loss.data.item())
+                current_lr_step = scheduler.get_last_lr()[0]
                 print('epoch: {:04d}'.format(n_d * num_epoch + n_ep + 1), 'step: {:04d}'.format(step + 1), 'loss: {:.4f}'.format(np.mean(loss_per_epoch)), 'grad_norm: {:.4f}'.format(grad_norm.item()), 'time: {:.4f}'.format(time.time() - t1))
+
+                # --- Write one row to this epoch's CSV log ---
+                # All individual loss values are recorded even if contrastive_mode != 'USER'
+                # (they will be logged as 0.0 in that case so the CSV schema stays consistent).
+                _pred  = predictor_loss.data.item()
+                _nce   = user_infoNCE_loss.data.item()   if contrastive_mode == 'USER' else 0.0
+                _deb   = news_debiased_loss.data.item()  if contrastive_mode == 'USER' else 0.0
+                _total = loss.data.item()
+                _mean  = float(np.mean(loss_per_epoch))
+                _gnorm = float(grad_norm.item())
+                _lr    = current_lr_step
+                _time  = float(time.time() - t1)
+                log_writer.writerow([
+                    n_d * num_epoch + n_ep + 1,  # epoch
+                    step + 1,                    # step (1-indexed)
+                    round(_pred,  6),
+                    round(_nce,   6),
+                    round(_deb,   6),
+                    round(_total, 6),
+                    round(_mean,  6),
+                    round(_gnorm, 6),
+                    round(_lr,    8),
+                    round(_time,  4),
+                ])
+                # Flush after every row so the file is readable even if training crashes
+                # mid-epoch — you won't lose the completed steps.
+                log_file.flush()
 
             # FIX 5 (continued): Step the scheduler once per epoch (not per batch).
             # After each full epoch, the scheduler lowers lr slightly along the cosine curve.
@@ -249,6 +302,10 @@ if __name__ == '__main__':
             current_lr = scheduler.get_last_lr()[0]
             print('epoch: {:04d}'.format(n_d * num_epoch + n_ep + 1), 'time: {:.4f}'.format(time.time() - t0), 'lr: {:.6f}'.format(current_lr))
             torch.save(model.state_dict(), preserve_dir + '/model_{}.pkl'.format(n_d * num_epoch + n_ep + 1))
+
+            # Close the epoch's CSV log now that all steps are written.
+            log_file.close()
+            print('Loss log saved: {}'.format(log_path))
 
         del train_candidate, train_user, train_label
     print("TRAINING DONE-------------------------------------------------------------------------------------------------------------------------------------------------")
